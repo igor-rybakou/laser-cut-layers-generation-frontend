@@ -129,6 +129,14 @@ exist, otherwise it keeps serving 404s at `/`.
   wrong once already (centered on `(0,0)` instead of `(half, half)`,
   producing a tiny cropped circle in one corner); the fix is in a comment
   right above where it's computed now.
+- **The map preview's footprint is derived, not guessed.** `mapgen/project.py`'s
+  `Projector` defines the canvas as a real-world square of side `2 * radius_m`
+  centered on lat/lng, with `mm_per_m = size_mm / (2 * radius_m)`; a circle
+  boundary is exactly inscribed in it. `map-preview.ts` draws that square (the
+  OSM fetch extent *and* the sheet extent) plus the resolved cut boundary, so
+  the overlay stays truthful only as long as that docstring does. Tiles are Web
+  Mercator while the generator projects in UTM — sub-pixel divergence at these
+  radii, not at tens of km.
 - **Defect detection** (`defects.ts`) is a deliberately approximate,
   client-side pass — vertex-vs-non-adjacent-edge distance for narrow necks
   (capped at ~1500 vertices/piece, worst 20 markers/sheet), not an
@@ -149,6 +157,7 @@ src/
   controls.ts          generic form controls (number/text/bool/enum)
   left-panel.ts         schema-driven param panel, generate header, stack editor
   place-search.ts       Nominatim search (debounced, localStorage-cached)
+  map-preview.ts        OSM tile map for picking the center + footprint overlay
   presets.ts             preset gallery (backend CRUD + client-side thumbnails)
   svg-parser.ts          sheet SVG -> ParsedSheet (contract-aware, no SVG lib)
   geometry.ts             polygon math (area, point-in-poly, boundary shapes)
@@ -183,7 +192,10 @@ accent on the toggle that controls it. `Barlow Condensed` for labels/controls,
 
 - Nominatim's usage policy wants a custom `User-Agent`; browsers block
   scripts from setting that header on `fetch`. No client-side fix exists —
-  `place-search.ts` relies on the automatic `Referer` header instead.
+  `place-search.ts` relies on the automatic `Referer` header instead. The same
+  limitation applies to `map-preview.ts`'s tile requests to
+  `tile.openstreetmap.org`, which is why it caches tiles in memory, fetches
+  only the visible viewport, and renders the required attribution link.
 - `npm audit` reports a moderate/high advisory in Vite 5's bundled esbuild —
   dev-server-only (a CORS-adjacent issue affecting `vite dev`), doesn't touch
   the production build. Not upgraded to Vite 8 (breaking major) for this.

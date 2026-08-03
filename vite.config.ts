@@ -15,6 +15,7 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    port: 8080,
     proxy: {
       '/api': {
         target: BACKEND_URL,

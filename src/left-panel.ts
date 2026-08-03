@@ -10,6 +10,7 @@ import {
 import { debounce } from './debounce';
 import { deriveMinFeatureWidthMm } from './defects';
 import { runGenerate, updateParams } from './generate';
+import { mountMapPreview } from './map-preview';
 import { paletteSheetColor, PALETTES, sheetColorCss, type SheetRole } from './materials';
 import { getPath } from './paths';
 import { searchPlace, type PlaceResult } from './place-search';
@@ -382,6 +383,7 @@ function buildGroupSection(groupName: string, fields: SchemaField[]): HTMLElemen
   const body = el('div', 'group-body');
   if (groupName === 'source') {
     body.appendChild(buildPlaceSearch());
+    mountMapPreview(body);
   }
 
   // Fields a custom editor above already renders. They must not also get a
