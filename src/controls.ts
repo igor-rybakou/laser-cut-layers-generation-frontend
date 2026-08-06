@@ -152,6 +152,63 @@ export function colorControl(opts: {
   return wrap;
 }
 
+// Multi-select over a fixed option list, for `enum_list` schema fields. The
+// backend rejects an empty include_layers.roads outright, so `minSelected`
+// locks the last remaining boxes instead of letting the UI compose a request
+// that can only come back 422.
+export function checklistControl(opts: {
+  options: { value: string; label?: string; title?: string }[];
+  value: string[];
+  minSelected?: number;
+  minTitle?: string;
+  onChange: (v: string[]) => void;
+}): HTMLElement & { setValue?: (v: string[]) => void } {
+  const wrap = el('div', 'ctl ctl-checklist');
+  const boxes = new Map<string, HTMLInputElement>();
+  const min = opts.minSelected ?? 0;
+  let current = [...opts.value];
+
+  const sync = (): void => {
+    const locked = current.length <= min;
+    for (const [value, box] of boxes) {
+      box.checked = current.includes(value);
+      // Only the checked ones lock -- unchecked boxes must stay clickable.
+      box.disabled = locked && box.checked;
+      const row = box.closest('.ctl-check') as HTMLElement | null;
+      row?.classList.toggle('is-locked', box.disabled);
+      if (box.disabled && opts.minTitle) row?.setAttribute('title', opts.minTitle);
+      else if (row) row.title = opts.options.find((o) => o.value === value)?.title ?? '';
+    }
+  };
+
+  for (const opt of opts.options) {
+    const row = el('label', 'ctl-check');
+    const box = el('input') as HTMLInputElement;
+    box.type = 'checkbox';
+    box.value = opt.value;
+    if (opt.title) row.title = opt.title;
+    box.addEventListener('change', () => {
+      current = opts.options
+        .map((o) => o.value)
+        .filter((v) => (v === opt.value ? box.checked : current.includes(v)));
+      sync();
+      opts.onChange([...current]);
+    });
+    boxes.set(opt.value, box);
+    row.appendChild(box);
+    row.appendChild(el('span', 'ctl-check-label', opt.label ?? opt.value));
+    wrap.appendChild(row);
+  }
+
+  const out = wrap as HTMLElement & { setValue?: (v: string[]) => void };
+  out.setValue = (v: string[]) => {
+    current = [...v];
+    sync();
+  };
+  sync();
+  return out;
+}
+
 export function enumControl(opts: {
   value: string;
   options: string[];

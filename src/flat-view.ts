@@ -1,5 +1,11 @@
 import { boundaryForSheet } from './geometry';
-import { PALETTES, sheetColorCss } from './materials';
+import {
+  engraveColorCss,
+  PALETTES,
+  plateEdgeColor,
+  sheetColorCss,
+  type EngraveKind,
+} from './materials';
 import { uiStore } from './state';
 import type { DefectMarker, Manifest, ParsedPath, ParsedSheet } from './types';
 
@@ -146,6 +152,42 @@ export class FlatView {
     this.dragging = false;
   }
 
+  private sheetOperation(sheet: ParsedSheet): 'cut' | 'engrave' {
+    return this.manifest?.sheets.find((s) => s.index === sheet.index)?.operation ?? 'cut';
+  }
+
+  // Physical assembly order, bottom of the glued stack first. It lives in
+  // `manifest.sheets[].stack_index` and nowhere else -- mapgen/layers.py says
+  // so explicitly, and the generator's preview.py composites by it. Falls back
+  // to `index` only for a manifest old enough not to carry it.
+  private stackOrder(): ParsedSheet[] {
+    const positionOf = (s: ParsedSheet): number => {
+      const sm = this.manifest?.sheets.find((m) => m.index === s.index);
+      return sm?.stack_index ?? s.index;
+    };
+    return [...this.sheets].sort((a, b) => positionOf(a) - positionOf(b));
+  }
+
+  // Sheets whose `cuts` group is a plate to fill, bottom-to-top. Two kinds of
+  // sheet are deliberately left unfilled, matching preview.py (which fills
+  // land and green and nothing else):
+  //  - `base`, the bottom backing plate: it is a full disc under everything,
+  //    so filling it would just hide the water showing through the cutouts.
+  //  - `operation: "engrave"` sheets (buildings, roads): their `cuts` group is
+  //    only the sheet's outer frame, and nothing is cut through it, so filling
+  //    it would bury the whole composite under one flat disc.
+  private bodySheets(): ParsedSheet[] {
+    return this.stackOrder().filter(
+      (s) => s.name !== 'base' && this.sheetOperation(s) === 'cut',
+    );
+  }
+
+  // Every sheet that carries engraving, in stack order so what is physically
+  // higher is drawn later: roads over buildings, buildings over the plates.
+  private engraveSheets(): ParsedSheet[] {
+    return this.stackOrder().filter((s) => s.paths.some((p) => p.group.startsWith('engraves_')));
+  }
+
   private worldTransform(): void {
     const { x, y, scale } = this.camera;
     this.ctx.setTransform(
@@ -184,53 +226,66 @@ export class FlatView {
     ctx.fillStyle = palette.water;
     ctx.fill(ringPath2D(boundary));
 
-    const land = this.sheets.find((s) => s.name === 'land');
-    const green = this.sheets.find((s) => s.name === 'green');
-    const base = this.sheets.find((s) => s.name === 'base');
-
     const selected = ui.selectedSheet;
     const dim = (idx: number) => selected != null && selected !== idx;
 
-    if (land && ui.showCuts) {
-      ctx.globalAlpha = dim(land.index) ? 0.25 : 1;
-      ctx.fillStyle = sheetColorCss(palette, 'land', ui.sheetColors);
-      ctx.strokeStyle = palette.landEdge;
-      ctx.lineWidth = 0.3 / this.camera.scale;
-      for (const p of land.paths.filter((p) => p.group === 'cuts')) {
-        const p2d = pathToPath2D(p);
-        ctx.fill(p2d, 'evenodd');
-        ctx.stroke(p2d);
+    if (ui.showCuts) {
+      for (const sheet of this.bodySheets()) {
+        ctx.globalAlpha = dim(sheet.index) ? 0.25 : 1;
+        ctx.fillStyle = sheetColorCss(palette, sheet.name, ui.sheetColors);
+        ctx.strokeStyle = plateEdgeColor(palette, sheet.name);
+        ctx.lineWidth = 0.3 / this.camera.scale;
+        for (const p of sheet.paths.filter((p) => p.group === 'cuts')) {
+          const p2d = pathToPath2D(p);
+          ctx.fill(p2d, 'evenodd');
+          ctx.stroke(p2d);
+        }
+        ctx.globalAlpha = 1;
       }
-      ctx.globalAlpha = 1;
     }
 
-    if (green && ui.showCuts) {
-      ctx.globalAlpha = dim(green.index) ? 0.25 : 1;
-      ctx.fillStyle = sheetColorCss(palette, 'green', ui.sheetColors);
-      for (const p of green.paths.filter((p) => p.group === 'cuts')) {
-        ctx.fill(pathToPath2D(p), 'evenodd');
-      }
-      ctx.globalAlpha = 1;
-    }
+    if (ui.showEngraves) {
+      // Engraving comes from *every* sheet, and never from `base`: the base
+      // is the bottom of the stack, so the generator moved roads, buildings
+      // and the label off it (roads onto their own `wide`/`narrow` sheets,
+      // buildings onto sheet 3, the label onto `land`). A job where `base` has
+      // `engrave_outline_mm: 0` is the normal case, not a broken one.
+      for (const sheet of this.engraveSheets()) {
+        ctx.globalAlpha = dim(sheet.index) ? 0.25 : 1;
 
-    if (base && ui.showEngraves) {
-      ctx.globalAlpha = dim(base.index) ? 0.25 : 1;
-      const buildings = base.paths.filter((p) => p.group === 'engraves_building');
-      ctx.fillStyle = palette.engraveBuilding;
-      for (const p of buildings) ctx.fill(pathToPath2D(p), 'evenodd');
+        // A per-sheet override, when the user pins one, replaces the burn tone
+        // of everything that sheet engraves -- the palette's per-kind tones are
+        // only the default underneath it.
+        const burn = (kind: EngraveKind): string =>
+          engraveColorCss(palette, kind, sheet.name, ui.engraveColors);
 
-      ctx.strokeStyle = palette.engraveRoad;
-      ctx.lineWidth = Math.max(0.15, 0.5 / this.camera.scale);
-      for (const p of base.paths.filter((p) => p.group === 'engraves_road')) {
-        ctx.stroke(pathToPath2D(p));
-      }
+        ctx.fillStyle = burn('building');
+        for (const p of sheet.paths.filter((p) => p.group === 'engraves_building')) {
+          ctx.fill(pathToPath2D(p), 'evenodd');
+        }
 
-      ctx.strokeStyle = palette.engraveText;
-      ctx.lineWidth = Math.max(0.1, 0.3 / this.camera.scale);
-      for (const p of base.paths.filter((p) => p.group === 'engraves_text')) {
-        ctx.stroke(pathToPath2D(p));
+        // Roads and text are closed area polygons (a buffered road ribbon,
+        // with the enclosed blocks as holes -- exactly the "holes as extra
+        // subpaths" contract), not centrelines. Fill them; the hairline
+        // stroke on top only keeps sub-mm ribbons from vanishing when the
+        // whole 300mm sheet is zoomed to fit and a 1.1mm road is a third of
+        // a pixel wide.
+        for (const [group, kind] of [
+          ['engraves_road', 'road'],
+          ['engraves_text', 'text'],
+        ] as const) {
+          const color = burn(kind);
+          ctx.fillStyle = color;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1 / this.camera.scale;
+          for (const p of sheet.paths.filter((p) => p.group === group)) {
+            const p2d = pathToPath2D(p);
+            ctx.fill(p2d, 'evenodd');
+            ctx.stroke(p2d);
+          }
+        }
+        ctx.globalAlpha = 1;
       }
-      ctx.globalAlpha = 1;
     }
 
     // Outer edge of the piece.

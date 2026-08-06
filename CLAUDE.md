@@ -68,19 +68,61 @@ exist, otherwise it keeps serving 404s at `/`.
   pattern that `test_output_contract.py` documents as an intended-but-not-yet
   built contract. Always read the actual filename off
   `manifest.sheets[].filename` / `job.files[]` — never construct it.
-- **There is no `--layers N` flag.** Sheet count is implied by data
-  (park geometry present?) and `config.layers.include_green_layer`, capped at
-  3 sheets total (base/land/green). `left-panel.ts`'s stack editor exposes
-  this honestly as a 2/3-sheet toggle, not a 2–5 selector.
-- **Physical stack order ≠ sheet `index` order.** `index` is base=0, land=1,
-  green=2, but the *physical* assembly (confirmed by reading the generator's
-  own `preview.py`, which composites base's engraving on top of green on top
-  of land) is: land at the bottom (nearest an under-mounted LED strip), green
-  in the middle, base on top (it carries all the engraving, so it has to be
-  the uncovered sheet to be visible at all). `three-view.ts`'s `ROLE_ORDER`
-  encodes this. Get this wrong and the exploded 3D view stacks base *under*
-  the land plate, which makes no physical sense — nothing above it could ever
-  reveal the engraving.
+- **There is no `--layers N` flag, and no single "layers" switch.** Which
+  sheets a run emits is spread over three unrelated config keys, which
+  `include_layers` exists to gather:
+  `green` → `config.layers.include_green_layer`, `buildings` →
+  `config.buildings.enabled`, `roads` → a filter over `config.roads.sheets`.
+  Three things to know before touching it:
+  - **base (0) and land (1) are never selectable** — base is the plate the
+    stack is glued to and land carries the label. `green` and `buildings` are
+    additionally dropped by the *generator* when the site has no park / no
+    building geometry, so a checked box is an upper bound, not a promise.
+  - **Sending an alias and its config key in one request is a 422**, not a
+    precedence rule — the backend refuses rather than silently discarding one
+    of the two values. `left-panel.ts` therefore *only ever writes the config
+    keys* for green/buildings and uses `include_layers` for `roads` alone
+    (which has no config-level equivalent); `setLayerFlag` also strips a stale
+    alias that an old preset may carry. `schema.py` deliberately does not
+    advertise the aliases for the same reason.
+  - **`include_layers.roads` cannot be empty** (the generator refuses an empty
+    `roads.sheets` block, so there is no way to ask for zero road sheets).
+    The last checked road sheet locks in the UI instead of composing a request
+    that can only come back 422.
+- **`config.buildings.enabled` is not a rendering flag.** With it false the OSM
+  building query — the largest and slowest request in a run — is never issued
+  at all. `render: "fill"` burns each block solid (most contrast, by far the
+  longest pass); `"outline"` traces the edges like the roads.
+- **`manifest.sheets[]` splits by `operation`, and `index` is not dense.**
+  `operation: "cut"` is a plate whose `cuts` are the material that remains
+  (base 0, land 1, green 2). `operation: "engrave"` is a sheet whose `cuts`
+  are *only its outer frame* and whose detail is burned on the surface
+  (buildings 3, road sheets 4+, one per `config.roads.sheets` entry). Index 3
+  is reserved whether or not buildings are on, so enabling them never
+  renumbers the road sheets — but a road sheet's index *is* positional over
+  the selected sheets, so dropping `wide` moves `narrow` to index 4 and
+  `config.material.thickness_mm.4` with it. Consequences:
+  - **All engraving lives outside `base`.** Roads, buildings and the label
+    were all moved off it. `base` with `engrave_outline_mm: 0` is the normal
+    case. Never read engraving off `base` alone — `flat-view.ts` did, and
+    roads silently vanished from the flat compositor.
+  - **Never fill an engrave sheet's `cuts`.** It is a full disc
+    (`cut_length_mm` 942.47 = π·300) with nothing cut through it, so filling
+    it buries the whole composite. Both views skip the body and keep the
+    sheet's thickness and stack slot, which is exactly what preview.py does by
+    filling only `land` and `green`. That boundary *is* a real cut, though —
+    `machine-time.ts` is right to count it.
+- **Physical stack order is `manifest.sheets[].stack_index`, and nothing
+  else** — not the filename, not `index`, not a role list in this repo.
+  `mapgen/layers.py` says so outright ("Anything that composites sheets —
+  preview.py, the workbench — must read this, not the filename") and
+  `preview.py` sorts by it. **base is the BOTTOM** backing plate: 0 base,
+  1 land (label), 2 green, 3 buildings, 4+ roads on top. Everything was moved
+  off base precisely because the land plate above it is ~100% of the disc on
+  an inland site, so anything burned into the base is under solid material and
+  invisible. This repo previously hardcoded the opposite order
+  (`ROLE_ORDER = land, green, base`) — it is gone; both views sort by
+  `stack_index`.
 - **Manifest has no `out_of_bounds` flag and no per-sheet resolved
   `min_feature_width_mm`.** Both are computed client-side in `defects.ts`:
   out-of-bounds directly from parsed geometry vs. the canvas boundary; the
@@ -97,6 +139,23 @@ exist, otherwise it keeps serving 404s at `/`.
   piece with holes as additional subpaths in the same `d`, top-level group
   ids restricted to `cuts` / `engraves_building` / `engraves_road` /
   `engraves_text`, 1 SVG unit = 1 mm, Y-down.
+- **`config.layers.road_widths_mm` is gone and is now *rejected*, not
+  ignored.** Road widths moved to `config.roads.sheets.<name>.class_widths_mm`
+  (plus `width_mm`, `class_widths_m`, `width_m`, `operation`), and every
+  request model is `extra="forbid"`, so one stale key 422s the whole request.
+  Those keys outlive a backend upgrade in `localStorage` and in the preset
+  store, which is what `paths.ts::pruneRetiredPaths` exists for — it runs on
+  the persisted params blob at startup and on every preset/snapshot load. Add
+  to `RETIRED_PATHS` whenever the backend retires a key.
+- **`engraves_road` is closed area polygons, not centrelines.** Every `d`
+  ends in `Z`; a road path is the *buffered* ribbon (widths from
+  `config.roads.sheets[].class_widths_mm`, 0.35–2.2mm) and the city blocks it
+  encloses come back as holes — one real job had a single `<path>` with 34
+  subpaths, i.e. one connected road network + 33 blocks. So the
+  exterior-first/holes-after reading of `ParsedPath.rings` holds here, and
+  both views fill with `evenodd` rather than stroking a polyline.
+  `flat-view.ts` still strokes a 1px hairline over the fill, because a 1.1mm
+  ribbon is a third of a pixel when 300mm is zoomed to fit.
 
 ## Architecture notes
 
@@ -155,7 +214,7 @@ src/
   types.ts             mirrors of every backend response/request shape
   paths.ts             dotted-path get/set for the nested params body
   controls.ts          generic form controls (number/text/bool/enum)
-  left-panel.ts         schema-driven param panel, generate header, stack editor
+  left-panel.ts         schema-driven param panel, generate header, layers editor
   place-search.ts       Nominatim search (debounced, localStorage-cached)
   map-preview.ts        OSM tile map for picking the center + footprint overlay
   presets.ts             preset gallery (backend CRUD + client-side thumbnails)
@@ -202,7 +261,26 @@ accent on the toggle that controls it. `Barlow Condensed` for labels/controls,
 - The 3D engrave mesh is one merged mesh per sheet regardless of
   building/road/text kind (all tinted the same darker material tone) — kinds
   are still visually distinguishable by shape (fill vs. thin outline
-  extrusion), just not by separate hue, to keep draw calls low.
+  extrusion), just not by separate hue, to keep draw calls low. The tone is
+  picked per sheet from whichever kind dominates it (`dominantEngraveKind`),
+  which is exact in practice — each sheet is single-kind.
+- **Viewport colours are overridable per sheet, keyed by sheet name.**
+  `uiStore` holds two sparse maps — `sheetColors` (plate body tone) and
+  `engraveColors` (burn tone) — keyed by `manifest.sheets[].name`, not by a
+  fixed role union, so a sheet the generator adds later gets its own entry
+  with no code change. A missing key or `null` means "follow the palette",
+  which is what keeps a palette switch moving every unpinned sheet. A sheet
+  can appear in both maps: `land` is a plate that also carries the label.
+  An `engraveColors` entry overrides that sheet's burn tone whatever the
+  engrave kind — pinning a sheet means the whole sheet.
+  Everything resolves through `materials.ts` (`sheetColorCss` /
+  `engraveColorCss` and their `*Hex` twins) so flat and 3D cannot disagree.
+  Live-ness is not special-cased: `<input type=color>` fires `input`
+  continuously, `viewport.ts` already re-renders the flat canvas and calls
+  `three.refreshUi()` on every `uiStore` write, and `applyUiState` retints
+  the 3D materials in place rather than re-extruding.
+  Water is *not* in either map — it is not a sheet, it is what shows through
+  the cutouts, so it stays on `palette.water`.
 
 ## Out of scope (per the original brief, don't add unless asked)
 

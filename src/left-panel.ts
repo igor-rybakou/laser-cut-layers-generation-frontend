@@ -1,5 +1,6 @@
 import {
   booleanControl,
+  checklistControl,
   colorControl,
   el,
   enumControl,
@@ -11,7 +12,14 @@ import { debounce } from './debounce';
 import { deriveMinFeatureWidthMm } from './defects';
 import { runGenerate, updateParams } from './generate';
 import { mountMapPreview } from './map-preview';
-import { paletteSheetColor, PALETTES, sheetColorCss, type SheetRole } from './materials';
+import {
+  engraveColorCss,
+  paletteEngraveColor,
+  paletteSheetColor,
+  PALETTES,
+  sheetColorCss,
+  type EngraveKind,
+} from './materials';
 import { getPath } from './paths';
 import { searchPlace, type PlaceResult } from './place-search';
 import { mountPresetsGallery } from './presets';
@@ -22,9 +30,9 @@ const GROUP_ORDER = ['source', 'canvas', 'stack', 'manufacturability', 'roads', 
 const GROUP_TITLES: Record<string, string> = {
   source: 'Source',
   canvas: 'Canvas',
-  stack: 'Stack',
+  stack: 'Layers & stack',
   manufacturability: 'Manufacturability',
-  roads: 'Road widths',
+  roads: 'Roads',
   label: 'Label',
 };
 
@@ -64,6 +72,14 @@ function buildFieldRow(field: SchemaField): HTMLElement {
       options: field.enum,
       onChange: (v) => setFieldValue(field, v),
     });
+  } else if (field.type === 'enum_list' && field.enum) {
+    // `min` on an enum_list is a minimum *count*, not a numeric bound.
+    ctl = checklistControl({
+      options: field.enum.map((v) => ({ value: v })),
+      value: Array.isArray(value) ? (value as string[]) : (field.enum ?? []),
+      minSelected: field.min ?? 0,
+      onChange: (v) => setFieldValue(field, v),
+    });
   } else if (field.type === 'boolean') {
     ctl = booleanControl({
       value: Boolean(value),
@@ -93,7 +109,7 @@ function buildFieldRow(field: SchemaField): HTMLElement {
 
 function refreshFieldRow(row: HTMLElement, field: SchemaField): void {
   const ctl = row.querySelector<HTMLElement & { setValue?: (v: unknown) => void }>(
-    '.ctl-number, .ctl-toggle, .ctl-segmented, .ctl-text',
+    '.ctl-number, .ctl-toggle, .ctl-segmented, .ctl-text, .ctl-checklist',
   );
   if (ctl?.setValue) ctl.setValue(fieldValue(field));
 }
@@ -154,54 +170,206 @@ function fieldByName(fields: SchemaField[], name: string): SchemaField | undefin
   return fields.find((f) => f.name === name);
 }
 
-interface StackRoleSpec {
-  role: SheetRole;
+// Schema field names this editor owns. Kept as names, not paths, because
+// buildGroupSection filters generic rows by name.
+const F_GREEN = 'include_green_layer'; // config.layers.include_green_layer
+const F_BUILDINGS = 'buildings_enabled'; // config.buildings.enabled
+const F_BUILDINGS_RENDER = 'buildings_render';
+const F_ROAD_SHEETS = 'road_sheets'; // include_layers.roads (enum_list)
+
+interface LayerCardSpec {
+  key: string;
+  // The manifest's own name for this sheet -- the key both colour maps and
+  // both views resolve tints by, so it has to match `manifest.sheets[].name`.
+  sheetName: string;
+  title: string;
   index: string;
-  position: string;
-  positionNote: string;
+  // A sheet shows up to two colours and gets a swatch for each it has: `plate`
+  // is the body tone (only sheets with a body, i.e. operation "cut"), `engrave`
+  // is the burn tone plus which palette tone it defaults to. `land` has both.
+  plate: boolean;
+  engraveKind: EngraveKind | null;
   cutRule: string;
   engraves: string;
+  positionNote: string;
+  // Which schema field turns this sheet on, if any. Absent = always emitted.
+  toggle: 'green' | 'buildings' | { roadSheet: string } | null;
+  thicknessField: string | null; // schema field name, or null when positional
+  roadSheet?: string;
 }
 
-// Cards are listed in *physical* assembly order, top sheet first -- NOT sheet
-// index order. Mirrors three-view.ts's ROLE_ORDER (reversed) and the
-// generator's own preview.py compositor: base carries every engrave, so it has
-// to be the uncovered sheet; land sits at the bottom nearest an LED strip.
-const STACK_ROLES: StackRoleSpec[] = [
-  {
-    role: 'base',
-    index: '00',
-    position: 'top',
-    positionNote: 'the only uncovered sheet — carries all engraving',
-    cutRule: 'boundary only',
-    engraves: 'buildings, roads, label',
-  },
-  {
-    role: 'green',
-    index: '02',
-    position: 'middle',
-    positionNote: 'emitted only if park geometry survives filtering',
-    cutRule: 'parks ∩ land',
-    engraves: 'none',
-  },
-  {
-    role: 'land',
-    index: '01',
-    position: 'bottom',
-    positionNote: 'nearest an under-mounted LED strip',
-    cutRule: 'land ∩ boundary − water',
-    engraves: 'none',
-  },
-];
+// Cards are listed bottom of the glued stack first, matching
+// manifest.stack_index. The generator is explicit about this order and about
+// why it matters (mapgen/layers.py): base is the BOTTOM backing plate and
+// carries no engraving at all -- roads, buildings and the label were all moved
+// off it precisely because anything burned there ends up under the land plate
+// and cannot be seen in the finished object.
+function layerCards(roadSheets: string[]): LayerCardSpec[] {
+  return [
+    {
+      key: 'base',
+      sheetName: 'base',
+      title: 'base',
+      index: '00',
+      plate: true,
+      engraveKind: null,
+      cutRule: 'boundary only',
+      engraves: 'none — it is the bottom of the stack',
+      positionNote: 'the backing plate everything else is glued to',
+      toggle: null,
+      thicknessField: 'thickness_mm_base',
+    },
+    {
+      key: 'land',
+      sheetName: 'land',
+      title: 'land',
+      index: '01',
+      plate: true,
+      engraveKind: 'text',
+      cutRule: 'land ∩ boundary − water',
+      engraves: 'the place label',
+      positionNote:
+        'always emitted and always the full plate, which is why the label lives here',
+      toggle: null,
+      thicknessField: 'thickness_mm_land',
+    },
+    {
+      key: 'green',
+      sheetName: 'green',
+      title: 'green',
+      index: '02',
+      plate: true,
+      engraveKind: null,
+      cutRule: 'parks ∩ land',
+      engraves: 'none',
+      positionNote: 'also dropped by the generator if no park geometry survives filtering',
+      toggle: 'green',
+      thicknessField: 'thickness_mm_green',
+    },
+    {
+      key: 'buildings',
+      sheetName: 'buildings',
+      title: 'buildings',
+      index: '03',
+      plate: false,
+      engraveKind: 'building',
+      cutRule: 'outer frame only (engraved sheet)',
+      engraves: 'building blocks',
+      positionNote:
+        'off means the OSM building query — the slowest request in a run — is never issued',
+      toggle: 'buildings',
+      thicknessField: 'thickness_mm_buildings',
+    },
+    ...roadSheets.map((name, i) => ({
+      key: `road_${name}`,
+      sheetName: name,
+      title: `roads · ${name}`,
+      index: `0${4 + i}`,
+      plate: false,
+      engraveKind: 'road' as EngraveKind,
+      cutRule: 'outer frame only (engraved sheet)',
+      engraves: `${name} road classes`,
+      positionNote: 'the detail you actually look at, so it sits on top',
+      toggle: { roadSheet: name },
+      thicknessField: null, // positional -- see roadThicknessField
+      roadSheet: name,
+    })) as LayerCardSpec[],
+  ];
+}
 
-// Field names the stack editor renders itself -- buildGroupSection skips these
+// Field names the layers editor renders itself -- buildGroupSection skips these
 // so they don't also appear as generic rows underneath. Anything else the
 // backend ever adds to the `stack` group still falls through to a generic row.
-export function stackEditorOwnedFields(): Set<string> {
-  return new Set([
-    'include_green_layer',
-    ...STACK_ROLES.map((s) => `thickness_mm_${s.role}`),
+export function stackEditorOwnedFields(fields: SchemaField[]): Set<string> {
+  const owned = new Set([
+    F_GREEN,
+    F_BUILDINGS,
+    F_BUILDINGS_RENDER,
+    F_ROAD_SHEETS,
+    'thickness_mm_base',
+    'thickness_mm_land',
+    'thickness_mm_green',
+    'thickness_mm_buildings',
   ]);
+  // Road thickness descriptors are positional and get rebuilt here against the
+  // *current* selection, so their as-shipped rows must not appear as well.
+  for (const f of fields) if (f.name.startsWith('thickness_mm_road_')) owned.add(f.name);
+  return owned;
+}
+
+// ---- include_layers.roads -------------------------------------------------
+
+function shippedRoadSheets(field: SchemaField | undefined): string[] {
+  return field?.enum ?? [];
+}
+
+function selectedRoadSheets(field: SchemaField | undefined): string[] {
+  const shipped = shippedRoadSheets(field);
+  const raw = getPath(paramsStore.get(), 'include_layers.roads');
+  if (!Array.isArray(raw)) return shipped; // omitted = all of them
+  const picked = shipped.filter((n) => raw.includes(n));
+  // An empty or unrecognisable selection is read as "all": the backend refuses
+  // an empty roads list outright, so it can never have meant zero sheets.
+  return picked.length > 0 ? picked : shipped;
+}
+
+function setSelectedRoadSheets(field: SchemaField | undefined, names: string[]): void {
+  const shipped = shippedRoadSheets(field);
+  const ordered = shipped.filter((n) => names.includes(n));
+  if (ordered.length === 0) return;
+  updateParams((draft) => {
+    if (ordered.length === shipped.length) {
+      // All of them is the default. Omitting the key rather than sending the
+      // full list keeps the body byte-identical to one that never touched it,
+      // so the backend's param hash still hits the same cache entry.
+      if (draft.include_layers) {
+        delete draft.include_layers.roads;
+        if (Object.keys(draft.include_layers).length === 0) delete draft.include_layers;
+      }
+      return;
+    }
+    draft.include_layers = { ...(draft.include_layers ?? {}), roads: ordered };
+  });
+}
+
+// A road sheet's output index is positional over the *selected* sheets, so
+// `thickness_mm.4` means "whichever road sheet comes first", not "wide". The
+// descriptors ship at the all-selected positions; rebuild the path against the
+// live selection instead of trusting the shipped one.
+function roadThicknessField(
+  fields: SchemaField[],
+  sheet: string,
+  position: number,
+): SchemaField | undefined {
+  const shipped = fields.find((f) => f.name.startsWith('thickness_mm_road_'));
+  if (!shipped) return undefined;
+  const baseIndex = parseInt(shipped.path.split('.').pop() ?? '4', 10);
+  const firstName = shipped.name.slice('thickness_mm_road_'.length);
+  const shippedOffset = shippedRoadSheets(fields.find((f) => f.name === F_ROAD_SHEETS)).indexOf(
+    firstName,
+  );
+  const zero = baseIndex - Math.max(0, shippedOffset);
+  return {
+    ...shipped,
+    name: `thickness_mm_road_${sheet}`,
+    path: `config.material.thickness_mm.${zero + position}`,
+  };
+}
+
+// ---- green / buildings ----------------------------------------------------
+
+// Both are spelled two ways in the API -- config.layers.include_green_layer /
+// include_layers.green, config.buildings.enabled / include_layers.buildings --
+// and sending both spellings in one request is a 422 rather than a precedence
+// rule. This app always writes the config key, so it also has to clear the
+// alias, which an imported preset or an older persisted params blob may carry.
+function setLayerFlag(field: SchemaField, alias: 'green' | 'buildings', value: boolean): void {
+  setFieldValue(field, value);
+  updateParams((draft) => {
+    if (!draft.include_layers || draft.include_layers[alias] === undefined) return;
+    delete draft.include_layers[alias];
+    if (Object.keys(draft.include_layers).length === 0) delete draft.include_layers;
+  });
 }
 
 function buildStackEditor(fields: SchemaField[]): HTMLElement {
@@ -210,33 +378,22 @@ function buildStackEditor(fields: SchemaField[]): HTMLElement {
     el(
       'p',
       'stack-editor-note',
-      'Roles, cut rules and engrave sources are fixed by the generator. Only thickness, tint and whether the green sheet is emitted are adjustable — tint is a preview aid, it is never sent to the backend.',
+      'Which optional sheets to emit. Roles, cut rules and stacking order are fixed by the generator — only inclusion, thickness and colour are yours. The square swatch is the sheet material, the round one is what is burned into it; both are preview aids that are never sent to the backend, and ↺ puts a sheet back on the palette.',
     ),
   );
 
-  const includeGreen = fieldByName(fields, 'include_green_layer');
+  const greenField = fieldByName(fields, F_GREEN);
+  const buildingsField = fieldByName(fields, F_BUILDINGS);
+  const buildingsRenderField = fieldByName(fields, F_BUILDINGS_RENDER);
+  const roadSheetsField = fieldByName(fields, F_ROAD_SHEETS);
+  const shippedRoads = shippedRoadSheets(roadSheetsField);
 
   const head = el('div', 'stack-head');
-  let sheetsSeg: (HTMLElement & { setValue?: (v: string) => void }) | null = null;
-  if (includeGreen) {
-    const quick = el('div', 'stack-quick');
-    quick.appendChild(el('span', 'field-label', 'sheets'));
-    sheetsSeg = enumControl({
-      value: Boolean(fieldValue(includeGreen)) ? '3' : '2',
-      options: ['2', '3'],
-      onChange: (v) => setFieldValue(includeGreen, v === '3'),
-    });
-    quick.appendChild(sheetsSeg);
-    head.appendChild(quick);
-  }
+  const count = el('span', 'stack-count');
   const total = el('span', 'stack-total');
+  head.appendChild(count);
   head.appendChild(total);
   wrap.appendChild(head);
-  if (includeGreen) {
-    wrap.appendChild(
-      el('p', 'stack-editor-note', '2–3 sheets is the whole range — there is no --layers 2–5.'),
-    );
-  }
 
   const table = el('div', 'stack-table');
   wrap.appendChild(table);
@@ -249,20 +406,75 @@ function buildStackEditor(fields: SchemaField[]): HTMLElement {
   const paramRefreshers: (() => void)[] = [];
   const uiRefreshers: (() => void)[] = [];
 
-  for (const spec of STACK_ROLES) {
+  // A card whose switch the schema does not offer is dropped rather than
+  // rendered with a checkbox that writes nowhere -- which is what an older
+  // backend (no config.buildings, no include_layers.roads) looks like from
+  // here. Road cards disappear on their own: shippedRoads is empty without
+  // the descriptor.
+  const cards = layerCards(shippedRoads).filter((spec) => {
+    if (spec.toggle === 'green') return !!greenField;
+    if (spec.toggle === 'buildings') return !!buildingsField;
+    return true;
+  });
+  // Is this sheet switched on? Answered from the params body, never cached.
+  const isOn = (spec: LayerCardSpec): boolean => {
+    if (spec.toggle === null) return true;
+    if (spec.toggle === 'green') return !greenField || Boolean(fieldValue(greenField));
+    if (spec.toggle === 'buildings') return !!buildingsField && Boolean(fieldValue(buildingsField));
+    return selectedRoadSheets(roadSheetsField).includes(spec.toggle.roadSheet);
+  };
+  // The thickness path of a road sheet depends on how many road sheets before
+  // it are selected, so it is resolved per refresh rather than once.
+  const thicknessFieldFor = (spec: LayerCardSpec): SchemaField | undefined => {
+    if (spec.thicknessField) return fieldByName(fields, spec.thicknessField);
+    if (!spec.roadSheet) return undefined;
+    const position = selectedRoadSheets(roadSheetsField).indexOf(spec.roadSheet);
+    if (position < 0) return undefined;
+    return roadThicknessField(fields, spec.roadSheet, position);
+  };
+
+  // Displayed top of the stack first: that is the order you meet the sheets in
+  // when you look at the finished object. The specs themselves are bottom-first
+  // (stack_index order), so this is a reversed copy, not a different truth.
+  for (const spec of [...cards].reverse()) {
     const card = el('div', 'stack-card');
-    card.dataset.role = spec.role;
+    card.dataset.role = spec.sheetName;
 
     const header = el('div', 'stack-card-head');
+
+    // ---- the include checkbox -------------------------------------------
+    let box: HTMLInputElement | null = null;
+    if (spec.toggle === null) {
+      const always = el('span', 'stack-always', 'always');
+      always.title = 'not selectable: base is the plate the stack is glued to, land carries the label';
+      header.appendChild(always);
+    } else {
+      const checkWrap = el('label', 'ctl-check stack-check');
+      box = el('input') as HTMLInputElement;
+      box.type = 'checkbox';
+      const toggle = spec.toggle;
+      box.addEventListener('change', () => {
+        if (toggle === 'green' && greenField) setLayerFlag(greenField, 'green', box!.checked);
+        else if (toggle === 'buildings' && buildingsField)
+          setLayerFlag(buildingsField, 'buildings', box!.checked);
+        else if (typeof toggle === 'object') {
+          const current = selectedRoadSheets(roadSheetsField);
+          const next = box!.checked
+            ? [...current, toggle.roadSheet]
+            : current.filter((n) => n !== toggle.roadSheet);
+          setSelectedRoadSheets(roadSheetsField, next);
+        }
+      });
+      checkWrap.appendChild(box);
+      header.appendChild(checkWrap);
+    }
+
     const swatchSlot = el('div', 'stack-card-swatch');
     header.appendChild(swatchSlot);
     header.appendChild(el('span', 'stack-idx', spec.index));
-    header.appendChild(el('span', 'stack-name', spec.role));
+    header.appendChild(el('span', 'stack-name', spec.title));
     const offTag = el('span', 'stack-off-tag', 'not emitted');
     header.appendChild(offTag);
-    const posTag = el('span', 'stack-pos', spec.position);
-    posTag.title = spec.positionNote;
-    header.appendChild(posTag);
     card.appendChild(header);
 
     const meta = el('div', 'stack-card-meta');
@@ -271,48 +483,116 @@ function buildStackEditor(fields: SchemaField[]): HTMLElement {
     meta.appendChild(el('span', 'stack-meta-key', 'engraves'));
     meta.appendChild(el('span', 'stack-meta-val', spec.engraves));
     card.appendChild(meta);
+    const note = el('p', 'stack-card-note', spec.positionNote);
+    card.appendChild(note);
 
     const controls = el('div', 'stack-card-controls');
     card.appendChild(controls);
 
-    // ---- tint swatch -----------------------------------------------------
-    const swatch: ColorControl = colorControl({
-      value: sheetColorCss(PALETTES[uiStore.get().materialPalette], spec.role, uiStore.get().sheetColors),
-      overridden: uiStore.get().sheetColors[spec.role] != null,
-      title: `${spec.role} material tint (preview only)`,
-      onChange: (v) =>
-        uiStore.update((s) => ({ ...s, sheetColors: { ...s.sheetColors, [spec.role]: v } })),
-      onReset: () =>
-        uiStore.update((s) => ({ ...s, sheetColors: { ...s.sheetColors, [spec.role]: null } })),
-    });
-    swatchSlot.appendChild(swatch);
+    // ---- colour swatches -------------------------------------------------
+    // One per visible contribution: a plate gets a body tone, anything that
+    // engraves gets a burn tone, and `land` gets both. Writing straight to
+    // uiStore is what makes them live -- viewport.ts re-renders the flat
+    // canvas and retints the 3D materials on every uiStore write, and
+    // `<input type=color>` fires `input` continuously while the OS picker is
+    // open, so the change lands before the picker is even dismissed.
+    const addSwatch = (
+      kind: 'plate' | 'engrave',
+      read: (ui: ReturnType<typeof uiStore.get>) => { effective: string; base: string; pinned: string | null },
+      write: (v: string | null) => void,
+    ): void => {
+      const initial = read(uiStore.get());
+      const swatch: ColorControl = colorControl({
+        value: initial.effective,
+        overridden: initial.pinned != null,
+        onChange: (v) => write(v),
+        onReset: () => write(null),
+      });
+      swatch.classList.add(kind === 'plate' ? 'swatch-plate' : 'swatch-engrave');
+      swatchSlot.appendChild(swatch);
 
-    uiRefreshers.push(() => {
-      const ui = uiStore.get();
-      const palette = PALETTES[ui.materialPalette];
-      const override = ui.sheetColors[spec.role];
-      const effective = sheetColorCss(palette, spec.role, ui.sheetColors);
-      card.style.borderLeftColor = effective;
-      swatch.sync(
-        effective,
-        override != null,
-        override
-          ? `${spec.role} tint ${override} — overriding ${ui.materialPalette} ${paletteSheetColor(palette, spec.role)}`
-          : `${spec.role} tint — ${ui.materialPalette} ${paletteSheetColor(palette, spec.role)} (preview only)`,
+      uiRefreshers.push(() => {
+        const ui = uiStore.get();
+        const { effective, base, pinned } = read(ui);
+        // The card's left edge tracks the plate tone, or the burn tone for a
+        // sheet that has no plate -- so the list reads as a stack of colours.
+        if (kind === 'plate' || !spec.plate) card.style.borderLeftColor = effective;
+        const what = kind === 'plate' ? 'material tint' : 'burn colour';
+        swatch.sync(
+          effective,
+          pinned != null,
+          pinned
+            ? `${spec.title} ${what} ${pinned} — overriding ${ui.materialPalette} ${base}`
+            : `${spec.title} ${what} — ${ui.materialPalette} ${base} (preview only)`,
+        );
+      });
+    };
+
+    const name = spec.sheetName;
+    if (spec.plate) {
+      addSwatch(
+        'plate',
+        (ui) => {
+          const palette = PALETTES[ui.materialPalette];
+          return {
+            effective: sheetColorCss(palette, name, ui.sheetColors),
+            base: paletteSheetColor(palette, name),
+            pinned: ui.sheetColors[name] ?? null,
+          };
+        },
+        (v) => uiStore.update((s) => ({ ...s, sheetColors: { ...s.sheetColors, [name]: v } })),
       );
-    });
+    }
+    const engraveKind = spec.engraveKind;
+    if (engraveKind) {
+      addSwatch(
+        'engrave',
+        (ui) => {
+          const palette = PALETTES[ui.materialPalette];
+          return {
+            effective: engraveColorCss(palette, engraveKind, name, ui.engraveColors),
+            base: paletteEngraveColor(palette, engraveKind),
+            pinned: ui.engraveColors[name] ?? null,
+          };
+        },
+        (v) => uiStore.update((s) => ({ ...s, engraveColors: { ...s.engraveColors, [name]: v } })),
+      );
+    }
+
+    // ---- buildings render mode -------------------------------------------
+    if (spec.key === 'buildings' && buildingsRenderField) {
+      const row = el('div', 'stack-thickness-row');
+      const label = el('span', 'field-label', 'render');
+      label.title = buildingsRenderField.description;
+      row.appendChild(label);
+      const seg = enumControl({
+        value: String(fieldValue(buildingsRenderField) ?? buildingsRenderField.enum?.[0] ?? 'fill'),
+        options: buildingsRenderField.enum ?? ['fill', 'outline'],
+        onChange: (v) => setFieldValue(buildingsRenderField, v),
+      }) as HTMLElement & { setValue?: (v: string) => void };
+      row.appendChild(seg);
+      controls.appendChild(row);
+      paramRefreshers.push(() => {
+        seg.setValue?.(String(fieldValue(buildingsRenderField) ?? 'fill'));
+      });
+    }
 
     // ---- thickness + derived neck threshold ------------------------------
-    const thicknessField = fieldByName(fields, `thickness_mm_${spec.role}`);
-    if (thicknessField) {
+    const initialThickness = thicknessFieldFor(spec);
+    if (initialThickness) {
       const row = el('div', 'stack-thickness-row');
       row.appendChild(el('span', 'field-label', 'thickness'));
       const ctl = numberControl({
-        value: Number(fieldValue(thicknessField) ?? 3),
-        min: thicknessField.min,
-        max: thicknessField.max,
-        unit: thicknessField.unit,
-        onChange: (v) => setFieldValue(thicknessField, v),
+        value: Number(fieldValue(initialThickness) ?? 3),
+        min: initialThickness.min,
+        max: initialThickness.max,
+        unit: initialThickness.unit,
+        // Resolved again on write: a road sheet's index moves when an earlier
+        // road sheet is unchecked, and the value must follow it.
+        onChange: (v) => {
+          const f = thicknessFieldFor(spec);
+          if (f) setFieldValue(f, v);
+        },
       }) as HTMLElement & { setValue?: (v: number) => void };
       row.appendChild(ctl);
       controls.appendChild(row);
@@ -321,7 +601,8 @@ function buildStackEditor(fields: SchemaField[]): HTMLElement {
       controls.appendChild(neck);
 
       paramRefreshers.push(() => {
-        const t = Number(fieldValue(thicknessField) ?? 3);
+        const f = thicknessFieldFor(spec);
+        const t = Number((f ? fieldValue(f) : undefined) ?? 3);
         ctl.setValue?.(t);
         const explicit = getPath(paramsStore.get(), 'config.manufacturability.min_feature_width_mm');
         neck.textContent = `neck ≥ ${deriveMinFeatureWidthMm(explicit, t).toFixed(2)} mm`;
@@ -333,27 +614,45 @@ function buildStackEditor(fields: SchemaField[]): HTMLElement {
     }
 
     paramRefreshers.push(() => {
-      const off = spec.role === 'green' && !!includeGreen && !fieldValue(includeGreen);
-      card.classList.toggle('is-off', off);
+      const on = isOn(spec);
+      card.classList.toggle('is-off', !on);
       // `inert` keeps a card for a sheet that will not be emitted out of the
       // tab order, rather than merely dimming it.
-      if (off) controls.setAttribute('inert', '');
-      else controls.removeAttribute('inert');
-      offTag.style.display = off ? '' : 'none';
+      if (on) controls.removeAttribute('inert');
+      else controls.setAttribute('inert', '');
+      offTag.style.display = on ? 'none' : '';
+
+      if (!box) return;
+      box.checked = on;
+      // The backend refuses an empty include_layers.roads, so the last checked
+      // road sheet locks instead of composing a request that can only 422.
+      const lastRoad =
+        typeof spec.toggle === 'object' && on && selectedRoadSheets(roadSheetsField).length <= 1;
+      box.disabled = lastRoad;
+      const checkWrap = box.parentElement;
+      checkWrap?.classList.toggle('is-locked', lastRoad);
+      if (checkWrap) {
+        checkWrap.title = lastRoad
+          ? 'at least one road sheet is required — the generator refuses an empty roads.sheets block'
+          : '';
+      }
     });
 
     table.appendChild(card);
   }
 
   paramRefreshers.push(() => {
-    const greenOn = !includeGreen || Boolean(fieldValue(includeGreen));
-    if (includeGreen) sheetsSeg?.setValue?.(greenOn ? '3' : '2');
     let sum = 0;
-    for (const spec of STACK_ROLES) {
-      if (spec.role === 'green' && !greenOn) continue;
-      const f = fieldByName(fields, `thickness_mm_${spec.role}`);
+    let emitted = 0;
+    for (const spec of cards) {
+      if (!isOn(spec)) continue;
+      emitted++;
+      const f = thicknessFieldFor(spec);
       if (f) sum += Number(fieldValue(f) ?? 0);
     }
+    count.textContent = `${emitted} of ${cards.length} sheets`;
+    count.title =
+      'green and buildings are dropped by the generator anyway when the site has no park / no building geometry, so this is an upper bound';
     total.textContent = `${sum.toFixed(1)} mm total`;
     total.title = 'sum of the thicknesses that will actually be emitted';
   });
@@ -392,7 +691,7 @@ function buildGroupSection(groupName: string, fields: SchemaField[]): HTMLElemen
   let owned = new Set<string>();
   if (groupName === 'stack') {
     body.appendChild(buildStackEditor(fields));
-    owned = stackEditorOwnedFields();
+    owned = stackEditorOwnedFields(fields);
   }
 
   const genericFields = fields.filter((f) => !owned.has(f.name));

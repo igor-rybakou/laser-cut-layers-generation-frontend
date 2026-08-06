@@ -1,16 +1,28 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { engraveColorHex, PALETTES, sheetColorHex, type SheetRole } from './materials';
+import { engraveColorHex, PALETTES, sheetColorHex, type EngraveKind } from './materials';
 import { uiStore } from './state';
 import type { DefectMarker, Manifest, ParsedPath, ParsedSheet } from './types';
 
-// Physical assembly order, bottom to top -- NOT the same as sheet.index.
-// Derived from the generator repo's own preview.py compositor: base's
-// engraving is drawn on top of green, which is on top of land. Land sits at
-// the bottom (nearest an under-mounted LED strip), base (all the engraving)
-// sits on top so it is actually visible.
-const ROLE_ORDER = ['land', 'green', 'base'];
+// Physical assembly order is `manifest.sheets[].stack_index` (0 = bottom of
+// the glued stack) and nothing else -- not the filename, not `index`, and not
+// a role list kept here. mapgen/layers.py states it outright ("Anything that
+// composites sheets -- preview.py, the workbench -- must read this, not the
+// filename") and the generator's own preview.py sorts by it. Getting it wrong
+// buries engraving under an opaque plate, which has already shipped once.
+//
+// The current stack, for orientation only: base(0) is the BOTTOM backing
+// plate the rest is glued to and carries no engraving at all; land(1) carries
+// the label; green(2) the parks; buildings(3) and the road sheets(4+) are
+// engraved sheets on top, where the detail is actually visible.
+function stackOrder(manifest: Manifest, sheets: ParsedSheet[]): ParsedSheet[] {
+  const positionOf = (s: ParsedSheet): number => {
+    const sm = manifest.sheets.find((m) => m.index === s.index);
+    return sm?.stack_index ?? sm?.index ?? s.index;
+  };
+  return [...sheets].sort((a, b) => positionOf(a) - positionOf(b));
+}
 
 const EXPLODE_GAP_MM = 25;
 const ENGRAVE_DEPTH_MM = 0.4;
@@ -18,7 +30,9 @@ const ENGRAVE_LIFT_MM = 0.01;
 
 interface SheetGroupEntry {
   sheet: ParsedSheet;
-  role: SheetRole;
+  // Which palette burn tone this sheet's merged engrave mesh defaults to.
+  // Null when the sheet engraves nothing.
+  engraveKind: EngraveKind | null;
   group: THREE.Group;
   bodyMesh: THREE.Mesh | null;
   engraveMesh: THREE.Mesh | null;
@@ -46,6 +60,21 @@ function extrudeMerged(paths: ParsedPath[], half: number, depth: number): THREE.
     geoms.push(new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false, curveSegments: 1 }));
   }
   return geoms;
+}
+
+// One merged engrave mesh per sheet means one tone per sheet, so pick the
+// tone of whatever kind dominates it. In practice each sheet is single-kind
+// (buildings sheet -> buildings, road sheets -> roads, land -> the label), and
+// this stays honest if that ever stops being true.
+function dominantEngraveKind(paths: ParsedPath[]): EngraveKind {
+  const counts = { building: 0, road: 0, text: 0 };
+  for (const p of paths) {
+    if (p.group === 'engraves_building') counts.building++;
+    else if (p.group === 'engraves_road') counts.road++;
+    else if (p.group === 'engraves_text') counts.text++;
+  }
+  if (counts.building >= counts.road && counts.building >= counts.text) return 'building';
+  return counts.road >= counts.text ? 'road' : 'text';
 }
 
 function markerTexture(color: string, label: string): THREE.CanvasTexture {
@@ -229,24 +258,23 @@ export class ThreeView {
     const half = manifest.canvas.size_mm / 2;
     const palette = PALETTES[uiStore.get().materialPalette];
 
-    const ordered = ROLE_ORDER.map((role) => sheets.find((s) => s.name === role)).filter(
-      (s): s is ParsedSheet => !!s,
-    );
-    // Any sheet name the generator ever adds that isn't in ROLE_ORDER still
-    // gets rendered -- appended on top -- rather than silently dropped.
-    for (const s of sheets) if (!ordered.includes(s)) ordered.push(s);
-
     let cumulative = 0;
-    for (const sheet of ordered) {
+    for (const sheet of stackOrder(manifest, sheets)) {
       const sm = manifest.sheets.find((s) => s.index === sheet.index);
       const thickness = sm?.thickness_mm ?? 3;
-      const role: SheetRole =
-        sheet.name === 'land' || sheet.name === 'green' ? sheet.name : 'base';
 
       const cutsPaths = sheet.paths.filter((p) => p.group === 'cuts');
       const enginePaths = sheet.paths.filter((p) => p.group.startsWith('engraves_'));
+      const engraveKind = enginePaths.length > 0 ? dominantEngraveKind(enginePaths) : null;
 
-      const bodyGeoms = extrudeMerged(cutsPaths, half, thickness);
+      // An `operation: "engrave"` sheet (buildings, roads) is a real sheet
+      // with real thickness -- it keeps its slot in the stack -- but its
+      // `cuts` group is only the sheet's outer frame. Extruding that frame
+      // would put a solid disc over everything below it and there is nothing
+      // cut through it to see the stack by, so it gets no body: same choice
+      // the generator's preview.py makes by filling only land and green.
+      const isEngraveSheet = (sm?.operation ?? 'cut') === 'engrave';
+      const bodyGeoms = isEngraveSheet ? [] : extrudeMerged(cutsPaths, half, thickness);
       const engraveGeoms = extrudeMerged(enginePaths, half, ENGRAVE_DEPTH_MM);
 
       const group = new THREE.Group();
@@ -256,7 +284,7 @@ export class ThreeView {
       if (bodyGeoms.length > 0) {
         const merged = mergeGeometries(bodyGeoms, false);
         const mat = new THREE.MeshStandardMaterial({
-          color: sheetColorHex(palette, role, uiStore.get().sheetColors),
+          color: sheetColorHex(palette, sheet.name, uiStore.get().sheetColors),
           roughness: 0.85,
           metalness: 0,
         });
@@ -270,7 +298,12 @@ export class ThreeView {
       if (engraveGeoms.length > 0) {
         const merged = mergeGeometries(engraveGeoms, false);
         const mat = new THREE.MeshStandardMaterial({
-          color: engraveColorHex(palette, 'building'),
+          color: engraveColorHex(
+            palette,
+            engraveKind ?? 'building',
+            sheet.name,
+            uiStore.get().engraveColors,
+          ),
           roughness: 0.85,
           metalness: 0,
         });
@@ -283,7 +316,7 @@ export class ThreeView {
       this.stackGroup.add(group);
       this.entries.push({
         sheet,
-        role,
+        engraveKind,
         group,
         bodyMesh,
         engraveMesh,
@@ -332,16 +365,18 @@ export class ThreeView {
     for (const e of this.entries) {
       if (e.bodyMesh) {
         e.bodyMesh.visible = ui.showCuts;
-        // Retint in place -- a palette switch or a stack-editor swatch change
-        // must not force a re-extrude of the merged geometry.
+        // Retint in place -- a palette switch or a layers-editor swatch change
+        // must not force a re-extrude of the merged geometry. This runs on
+        // every uiStore write, which is what makes the swatches live while the
+        // OS colour picker is still open.
         (e.bodyMesh.material as THREE.MeshStandardMaterial).color.setHex(
-          sheetColorHex(palette, e.role, ui.sheetColors),
+          sheetColorHex(palette, e.sheet.name, ui.sheetColors),
         );
       }
       if (e.engraveMesh) {
         e.engraveMesh.visible = ui.showEngraves;
         (e.engraveMesh.material as THREE.MeshStandardMaterial).color.setHex(
-          engraveColorHex(palette, 'building'),
+          engraveColorHex(palette, e.engraveKind ?? 'building', e.sheet.name, ui.engraveColors),
         );
       }
       const dim = ui.selectedSheet != null && ui.selectedSheet !== e.sheet.index;

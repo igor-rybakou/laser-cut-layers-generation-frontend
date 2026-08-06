@@ -1,5 +1,7 @@
 import { checkHealth } from './generate';
 import { el } from './controls';
+import { pruneRetiredPaths } from './paths';
+import type { GenerateParamsBody } from './types';
 import {
   healthStore,
   lastFromCacheStore,
@@ -73,7 +75,9 @@ export function mountStatusStrip(root: HTMLElement): void {
       thumb.src = snap.thumbnail;
       thumb.title = new Date(snap.createdAt).toLocaleTimeString();
       thumb.addEventListener('click', () => {
-        paramsStore.set(JSON.parse(JSON.stringify(snap.params)));
+        paramsStore.set(
+          pruneRetiredPaths(JSON.parse(JSON.stringify(snap.params))) as GenerateParamsBody,
+        );
       });
       filmstrip.appendChild(thumb);
     }

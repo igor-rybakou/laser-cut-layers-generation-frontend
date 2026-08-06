@@ -2,7 +2,10 @@
 export interface SchemaField {
   name: string;
   path: string; // dotted location in the POST /api/generate body
-  type: 'number' | 'integer' | 'string' | 'boolean' | 'enum';
+  // 'enum_list' is a multi-select over `enum` whose value is an array
+  // (currently only include_layers.roads). `min` is the minimum number of
+  // entries the backend will accept, not a numeric bound.
+  type: 'number' | 'integer' | 'string' | 'boolean' | 'enum' | 'enum_list';
   default: unknown;
   min?: number | null;
   max?: number | null;
@@ -33,6 +36,12 @@ export interface SheetManifest {
   bbox: [number, number, number, number];
   flags: string[];
   removed: { pieces: number; area_mm2: number };
+  // Optional: older generator builds omit both. `operation` is 'cut' for a
+  // real plywood sheet and 'engrave' for a pass that is burned onto the top
+  // sheet rather than cut out of its own (the road passes) -- its `cuts`
+  // group is only the boundary circle, used as a registration outline.
+  operation?: 'cut' | 'engrave';
+  stack_index?: number;
 }
 
 export interface Manifest {
@@ -75,6 +84,20 @@ export interface HealthResponse {
   jobs_count: number;
 }
 
+// Sugar for the three unrelated config keys that decide which optional
+// sheets a run emits (workbench/params.py's LayerSelection).
+//
+// `green` and `buildings` are *aliases* of config.layers.include_green_layer
+// and config.buildings.enabled, and sending an alias together with its config
+// key is a 422 -- the backend refuses to pick a winner. This app therefore
+// only ever writes the config keys for those two, and uses this object for
+// `roads` alone, which has no config-level equivalent.
+export interface LayerSelection {
+  green?: boolean;
+  buildings?: boolean;
+  roads?: string[]; // never empty: the generator refuses zero road sheets
+}
+
 // The nested request body for POST /api/generate, built from the flat
 // schema field paths. Matches workbench/params.py's GenerateParams 1:1.
 export interface GenerateParamsBody {
@@ -84,6 +107,7 @@ export interface GenerateParamsBody {
   size?: number;
   place_name?: string | null;
   land_polygons?: string | null;
+  include_layers?: LayerSelection;
   config?: Record<string, unknown>;
 }
 

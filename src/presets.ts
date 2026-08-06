@@ -1,5 +1,6 @@
 import { api } from './api';
 import { el } from './controls';
+import { pruneRetiredPaths } from './paths';
 import { paramsStore } from './state';
 import { captureFlatThumbnail } from './viewport';
 import type { GenerateParamsBody, PresetMap } from './types';
@@ -71,7 +72,13 @@ export function mountPresetsGallery(root: HTMLElement): void {
       card.appendChild(img);
       card.appendChild(el('div', 'preset-name', name));
       card.addEventListener('click', () => {
-        paramsStore.set(JSON.parse(JSON.stringify(presets[name])) as GenerateParamsBody);
+        // Presets live in the backend's store and can predate its current
+        // request models, so they get the same pruning as persisted params.
+        paramsStore.set(
+          pruneRetiredPaths(
+            JSON.parse(JSON.stringify(presets[name])) as Record<string, unknown>,
+          ) as GenerateParamsBody,
+        );
       });
 
       const delBtn = el('button', 'preset-delete', '×') as HTMLButtonElement;

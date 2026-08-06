@@ -1,4 +1,5 @@
 import { store } from './store';
+import { pruneRetiredPaths } from './paths';
 import { DEFAULT_MACHINE_TIME, type MachineTimeSettings } from './machine-time';
 import type { SheetColorOverrides } from './materials';
 import type {
@@ -40,8 +41,12 @@ const DEFAULT_PARAMS: GenerateParamsBody = {
   size: 300,
 };
 
+// Pruned on the way in as well as on every preset/snapshot load: a params blob
+// persisted against an older backend can carry keys the current one refuses
+// outright (see pruneRetiredPaths), and the failure mode is a 422 on the whole
+// request rather than an ignored field.
 export const paramsStore = store<GenerateParamsBody>(
-  loadJSON('workbench.params', DEFAULT_PARAMS),
+  pruneRetiredPaths(loadJSON('workbench.params', DEFAULT_PARAMS) as Record<string, unknown>) as GenerateParamsBody,
 );
 paramsStore.subscribe((v) => saveJSON('workbench.params', v), false);
 
@@ -81,9 +86,12 @@ export interface UiState {
   backlightOn: boolean;
   backlightIntensity: number;
   materialPalette: 'birch' | 'walnut' | 'dark';
-  // Per-role tint overrides from the stack editor's swatches. null = follow
-  // materialPalette, so switching palette still moves the untouched roles.
-  sheetColors: SheetColorOverrides;
+  // Per-sheet colour overrides from the layers editor's swatches, keyed by
+  // sheet name. Absent/null = follow materialPalette, so switching palette
+  // still moves every sheet the user has not pinned. Two maps because a sheet
+  // can show two colours: `land` is a plate that also carries the label.
+  sheetColors: SheetColorOverrides; // plate body tone
+  engraveColors: SheetColorOverrides; // burn tone
   showCuts: boolean;
   showEngraves: boolean;
   showNarrowNeck: boolean;
@@ -102,7 +110,8 @@ const DEFAULT_UI: UiState = {
   backlightOn: false,
   backlightIntensity: 0.6,
   materialPalette: 'birch',
-  sheetColors: { base: null, land: null, green: null },
+  sheetColors: {},
+  engraveColors: {},
   showCuts: true,
   showEngraves: true,
   showNarrowNeck: true,
@@ -112,13 +121,17 @@ const DEFAULT_UI: UiState = {
   collapsedGroups: {},
 };
 
-// sheetColors is merged key-by-key: a UI blob persisted before it existed (or
-// holding only some roles) must still get a full three-role record back.
+// The colour maps are merged key-by-key rather than replaced, so a UI blob
+// persisted before either existed still yields a usable record. They are
+// keyed by sheet name and sparse by design: an older blob's
+// `{base: null, land: null, green: null}` needs no migration -- a null entry
+// already means "follow the palette".
 const PERSISTED_UI = loadJSON<Partial<UiState>>('workbench.ui', {});
 export const uiStore = store<UiState>({
   ...DEFAULT_UI,
   ...PERSISTED_UI,
   sheetColors: { ...DEFAULT_UI.sheetColors, ...(PERSISTED_UI.sheetColors ?? {}) },
+  engraveColors: { ...DEFAULT_UI.engraveColors, ...(PERSISTED_UI.engraveColors ?? {}) },
 });
 uiStore.subscribe((v) => saveJSON('workbench.ui', v), false);
 

@@ -14,11 +14,18 @@ export interface Palette {
   engraveText: string;
 }
 
-export type SheetRole = 'base' | 'land' | 'green';
+export type EngraveKind = 'building' | 'road' | 'text';
 
-// Per-role tint overrides picked in the stack editor. `null` = follow whatever
-// the active palette says, so switching palette still moves untouched roles.
-export type SheetColorOverrides = Record<SheetRole, string | null>;
+// Colour overrides picked in the layers editor, keyed by *sheet name* -- the
+// manifest's own identifier for a sheet. Keyed by name rather than by a fixed
+// role union so a sheet the generator adds later (a third road sheet, say)
+// gets its own entry with no code change here. `null` or a missing key means
+// "follow whatever the active palette says", so switching palette still moves
+// every sheet the user has not pinned.
+//
+// Two separate maps because a sheet can contribute two visible colours: `land`
+// is a plate (body tone) that also carries the label (burn tone).
+export type SheetColorOverrides = Record<string, string | null>;
 
 export const PALETTES: Record<'birch' | 'walnut' | 'dark', Palette> = {
   birch: {
@@ -56,42 +63,75 @@ export const PALETTES: Record<'birch' | 'walnut' | 'dark', Palette> = {
   },
 };
 
-// The palette's own tone for a role, ignoring any user override.
-export function paletteSheetColor(palette: Palette, role: SheetRole): string {
-  const map: Record<SheetRole, string> = {
-    base: palette.base,
-    land: palette.land,
-    green: palette.green,
-  };
-  return map[role];
+// Palette tones a plate sheet can take. A sheet name with no tone of its own
+// falls back to the base tone -- it is plywood either way, and inventing a
+// fourth hue for it would break the palette (see the design-token rule).
+const PLATE_TONE: Record<string, 'base' | 'land' | 'green'> = {
+  base: 'base',
+  land: 'land',
+  green: 'green',
+};
+
+function isHex(v: unknown): v is string {
+  return typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
 }
 
-// Material tone per sheet role: the user's override if they picked one in the
-// stack editor, otherwise the palette's. Both views resolve through here so a
-// swatch change shows identically in flat and 3D.
+// The palette's own body tone for a sheet, ignoring any override.
+export function paletteSheetColor(palette: Palette, sheetName: string): string {
+  return palette[PLATE_TONE[sheetName] ?? 'base'];
+}
+
+// The palette's own burn tone for an engrave kind, ignoring any override.
+export function paletteEngraveColor(palette: Palette, kind: EngraveKind): string {
+  if (kind === 'building') return palette.engraveBuilding;
+  if (kind === 'road') return palette.engraveRoad;
+  return palette.engraveText;
+}
+
+// The edge line drawn around a filled plate. Not overridable: it is a hairline
+// separator, not a material tone.
+export function plateEdgeColor(palette: Palette, sheetName: string): string {
+  return sheetName === 'green' ? palette.greenEdge : palette.landEdge;
+}
+
+// Body tone per sheet: the user's override if they pinned one in the layers
+// editor, otherwise the palette's. Both views resolve through here so a swatch
+// change shows identically in flat and 3D.
 export function sheetColorCss(
   palette: Palette,
-  role: SheetRole,
+  sheetName: string,
   overrides?: SheetColorOverrides | null,
 ): string {
-  const override = overrides?.[role];
-  if (typeof override === 'string' && /^#[0-9a-f]{6}$/i.test(override)) return override;
-  return paletteSheetColor(palette, role);
+  const override = overrides?.[sheetName];
+  return isHex(override) ? override : paletteSheetColor(palette, sheetName);
 }
 
 export function sheetColorHex(
   palette: Palette,
-  role: SheetRole,
+  sheetName: string,
   overrides?: SheetColorOverrides | null,
 ): number {
-  return parseInt(sheetColorCss(palette, role, overrides).replace('#', ''), 16);
+  return parseInt(sheetColorCss(palette, sheetName, overrides).replace('#', ''), 16);
 }
 
-export function engraveColorHex(palette: Palette, kind: 'building' | 'road' | 'text'): number {
-  const map: Record<string, string> = {
-    building: palette.engraveBuilding,
-    road: palette.engraveRoad,
-    text: palette.engraveText,
-  };
-  return parseInt(map[kind].replace('#', ''), 16);
+// Burn tone for one sheet's engraving. A sheet-level override wins over the
+// per-kind palette tone for everything that sheet engraves -- pinning "roads ·
+// narrow" to a colour means that whole sheet, not just its road group.
+export function engraveColorCss(
+  palette: Palette,
+  kind: EngraveKind,
+  sheetName?: string,
+  overrides?: SheetColorOverrides | null,
+): string {
+  const override = sheetName ? overrides?.[sheetName] : undefined;
+  return isHex(override) ? override : paletteEngraveColor(palette, kind);
+}
+
+export function engraveColorHex(
+  palette: Palette,
+  kind: EngraveKind,
+  sheetName?: string,
+  overrides?: SheetColorOverrides | null,
+): number {
+  return parseInt(engraveColorCss(palette, kind, sheetName, overrides).replace('#', ''), 16);
 }

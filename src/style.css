@@ -427,14 +427,21 @@ body {
   align-items: center;
   gap: 8px;
 }
+.stack-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  cursor: help;
+}
 .stack-total {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--ink);
 }
 
-/* Cards run top sheet -> bottom sheet, i.e. physical assembly order, which is
-   NOT sheet index order. The connector line reinforces that they are a stack. */
+/* Cards run top sheet -> bottom sheet: manifest stack_index order, reversed
+   for display. That is NOT sheet index order -- base is index 0 and the
+   bottom of the stack, road sheets have the highest indices and sit on top. */
 .stack-table {
   display: flex;
   flex-direction: column;
@@ -458,8 +465,23 @@ body {
   align-items: center;
   gap: 7px;
 }
+/* Holds one or two swatches: a plate's body tone and/or its burn tone. The
+   engrave swatch is the smaller round one so the two never read as a pair of
+   equals -- one is the material, the other is what is burned into it. */
 .stack-card-swatch {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.swatch-engrave .ctl-color-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+}
+.swatch-engrave .ctl-color-swatch::-webkit-color-swatch,
+.swatch-engrave .ctl-color-swatch::-moz-color-swatch {
+  border-radius: 50%;
 }
 .stack-idx {
   font-family: var(--font-mono);
@@ -471,21 +493,66 @@ body {
   font-size: 13px;
   letter-spacing: 0.03em;
 }
-.stack-pos {
+.stack-off-tag {
   margin-left: auto;
   font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--signal);
+}
+/* The include checkbox and the "always" tag occupy the same slot at the head
+   of a card, so a locked sheet and a switchable one line up. */
+.stack-check {
+  flex-shrink: 0;
+}
+.stack-always {
+  flex-shrink: 0;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);
   border: 1px solid var(--line);
   border-radius: 2px;
-  padding: 0 4px;
+  padding: 0 3px;
   cursor: help;
 }
-.stack-off-tag {
+.stack-card-note {
   font-size: 10px;
-  font-family: var(--font-mono);
-  color: var(--signal);
+  color: var(--muted);
+  line-height: 1.35;
+  margin: 0;
+}
+
+/* Multi-select for enum_list fields, and the per-card include checkbox. A
+   locked box (the last road sheet) stays visibly checked rather than greying
+   out to look unset. */
+.ctl-checklist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.ctl-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.ctl-check input {
+  accent-color: var(--signal);
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  cursor: pointer;
+}
+.ctl-check.is-locked {
+  cursor: help;
+}
+.ctl-check.is-locked input {
+  cursor: help;
+  opacity: 0.7;
+}
+.ctl-check-label {
+  font-size: 12px;
+  letter-spacing: 0.02em;
 }
 
 .stack-card-meta {
